@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	kafka "github.com/segmentio/kafka-go"
 )
@@ -40,7 +41,16 @@ func main() {
 				log.Printf("kv-events-consumer: shutting down")
 				return
 			}
+			// Right after the cluster starts, the consumer group's
+			// offsets topic and coordinator may not be ready yet; back
+			// off briefly rather than busy-looping while that settles.
 			log.Printf("kv-events-consumer: read error: %v", err)
+			select {
+			case <-ctx.Done():
+				log.Printf("kv-events-consumer: shutting down")
+				return
+			case <-time.After(2 * time.Second):
+			}
 			continue
 		}
 

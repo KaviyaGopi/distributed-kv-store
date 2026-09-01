@@ -95,7 +95,7 @@ func run() error {
 
 	var publisher api.EventPublisher
 	if brokers := cfg.KafkaBrokerList(); len(brokers) > 0 {
-		producer := events.NewProducer(brokers, cfg.KafkaTopic).WithMetrics(m)
+		producer := events.NewProducer(brokers, cfg.KafkaTopic, config.NumShards).WithMetrics(m)
 		defer producer.Close()
 		publisher = producer
 		log.Printf("kvnode: publishing committed writes to Kafka topic %q on %v", cfg.KafkaTopic, brokers)
