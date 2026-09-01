@@ -36,12 +36,20 @@ type AddrBook interface {
 	All() map[string]string
 }
 
+// RequestRecorder observes KV request outcomes and latency for metrics.
+// op is "get", "put", or "delete"; status is "ok", "not_leader", or
+// "error". A nil RequestRecorder (the default) disables observation.
+type RequestRecorder interface {
+	ObserveRequest(op, shard, status string, duration time.Duration)
+}
+
 // Server serves the KV and admin HTTP API for one node.
 type Server struct {
 	node     *raftnode.Node
 	router   *shard.Router
 	addrs    AddrBook
 	events   EventPublisher
+	recorder RequestRecorder
 	applyTTL time.Duration
 
 	mux *http.ServeMux
@@ -63,6 +71,12 @@ func NewServer(node *raftnode.Node, router *shard.Router, addrs AddrBook, events
 	return s
 }
 
+// WithMetrics attaches a RequestRecorder that observes every KV request.
+func (s *Server) WithMetrics(r RequestRecorder) *Server {
+	s.recorder = r
+	return s
+}
+
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /kv/{key}", s.handleGet)
 	s.mux.HandleFunc("PUT /kv/{key}", s.handlePut)
@@ -75,11 +89,6 @@ func (s *Server) routes() {
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
-}
-
-func (s *Server) shardFor(key string) *raftnode.ShardPeer {
-	idx := s.router.ShardFor(key)
-	return s.node.Shards[idx]
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -110,22 +119,34 @@ func (s *Server) notLeaderResponse(w http.ResponseWriter, peer *raftnode.ShardPe
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	key := r.PathValue("key")
-	peer := s.shardFor(key)
+	shardIdx := s.router.ShardFor(key)
+	peer := s.node.Shards[shardIdx]
 
 	v, ok := peer.FSM.Get(key)
 	if !ok {
+		s.record("get", shardIdx, "error", start)
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "key not found"})
 		return
 	}
+	s.record("get", shardIdx, "ok", start)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"key":   key,
 		"value": v,
-		"shard": s.router.ShardFor(key),
+		"shard": shardIdx,
 	})
 }
 
+func (s *Server) record(op string, shardIdx int, status string, start time.Time) {
+	if s.recorder == nil {
+		return
+	}
+	s.recorder.ObserveRequest(op, strconv.Itoa(shardIdx), status, time.Since(start))
+}
+
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	key := r.PathValue("key")
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -133,25 +154,28 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.apply(w, key, fsm.Command{Op: fsm.OpPut, Key: key, Value: string(body)})
+	s.apply(w, "put", key, fsm.Command{Op: fsm.OpPut, Key: key, Value: string(body)}, start)
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	key := r.PathValue("key")
-	s.apply(w, key, fsm.Command{Op: fsm.OpDelete, Key: key})
+	s.apply(w, "delete", key, fsm.Command{Op: fsm.OpDelete, Key: key}, start)
 }
 
-func (s *Server) apply(w http.ResponseWriter, key string, cmd fsm.Command) {
+func (s *Server) apply(w http.ResponseWriter, op, key string, cmd fsm.Command, start time.Time) {
 	shardIdx := s.router.ShardFor(key)
 	peer := s.node.Shards[shardIdx]
 
 	if peer.Raft.State() != raft.Leader {
+		s.record(op, shardIdx, "not_leader", start)
 		s.notLeaderResponse(w, peer)
 		return
 	}
 
 	data, err := cmd.Encode()
 	if err != nil {
+		s.record(op, shardIdx, "error", start)
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to encode command"})
 		return
 	}
@@ -159,14 +183,17 @@ func (s *Server) apply(w http.ResponseWriter, key string, cmd fsm.Command) {
 	future := peer.Raft.Apply(data, s.applyTTL)
 	if err := future.Error(); err != nil {
 		if err == raft.ErrNotLeader || err == raft.ErrLeadershipLost {
+			s.record(op, shardIdx, "not_leader", start)
 			s.notLeaderResponse(w, peer)
 			return
 		}
+		s.record(op, shardIdx, "error", start)
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
 		return
 	}
 	if res := future.Response(); res != nil {
 		if fsmErr, ok := res.(error); ok {
+			s.record(op, shardIdx, "error", start)
 			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: fsmErr.Error()})
 			return
 		}
@@ -177,6 +204,7 @@ func (s *Server) apply(w http.ResponseWriter, key string, cmd fsm.Command) {
 		s.events.Publish(cmd.Op, cmd.Key, cmd.Value, shardIdx, raftIndex)
 	}
 
+	s.record(op, shardIdx, "ok", start)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"key":        key,
 		"shard":      shardIdx,

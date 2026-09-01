@@ -13,8 +13,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/KaviyaGopi/distributed-kv-store/internal/api"
 	"github.com/KaviyaGopi/distributed-kv-store/internal/config"
+	"github.com/KaviyaGopi/distributed-kv-store/internal/events"
+	"github.com/KaviyaGopi/distributed-kv-store/internal/metrics"
 	"github.com/KaviyaGopi/distributed-kv-store/internal/raftnode"
 	"github.com/KaviyaGopi/distributed-kv-store/internal/shard"
 )
@@ -79,11 +84,30 @@ func run() error {
 
 	router := shard.NewRouter(config.NumShards)
 
-	var events api.EventPublisher // wired to a real Kafka producer in a later step
-	server := api.NewServer(node, router, addrBook, events)
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+
+	stopPollers := make(chan struct{})
+	defer close(stopPollers)
+	for i, peer := range node.Shards {
+		go metrics.PollRaftStats(m, i, peer.Raft, time.Second, stopPollers)
+	}
+
+	var publisher api.EventPublisher
+	if brokers := cfg.KafkaBrokerList(); len(brokers) > 0 {
+		producer := events.NewProducer(brokers, cfg.KafkaTopic).WithMetrics(m)
+		defer producer.Close()
+		publisher = producer
+		log.Printf("kvnode: publishing committed writes to Kafka topic %q on %v", cfg.KafkaTopic, brokers)
+	} else {
+		log.Printf("kvnode: Kafka publishing disabled (no -kafka-brokers configured)")
+	}
+
+	server := api.NewServer(node, router, addrBook, publisher).WithMetrics(m)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", server)
+	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 
 	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: mux}
 
