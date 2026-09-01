@@ -1,0 +1,19 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Go build/test artifacts
+/dist/
+
+# Raft data directories
+/data/
+*.db
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
